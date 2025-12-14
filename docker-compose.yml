@@ -14,7 +14,7 @@ services:
       - LOGGER_URL=http://logger:8003
       # Point to Ollama on the host machine
       - LLM_API_BASE=${LLM_API_BASE}
-      - LLM_MODEL_NAME=llama3
+      - LLM_MODEL_NAME=secure-rag-llama3
       - LLM_PROVIDER=local
     depends_on:
       - retriever
@@ -26,7 +26,10 @@ services:
     ports:
       - "8001:8001"
     environment:
-      - VECTOR_DB_URL=postgres://user:password@vector_db:5432/ragdb
+      - DB_HOST=vector_db
+      - POSTGRES_DB=ragdb
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
     depends_on:
       - vector_db
 
