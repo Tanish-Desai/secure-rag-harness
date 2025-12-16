@@ -29,3 +29,6 @@ services/retriever/model_data/
 
 # Synthetic Data
 data/corpus/
+
+#Experiment results
+results/
