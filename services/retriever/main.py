@@ -1,93 +1,149 @@
 import os
 import logging
-import json
+import asyncio
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-from sentence_transformers import SentenceTransformer
-from pgvector.psycopg2 import register_vector
+from typing import Optional
 
-# Logging Setup
+from rankers.dense import DenseRanker
+from rankers.sparse import SparseRanker
+from rankers.fuser import RRFMerger
+
+# ------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("retriever")
+app = FastAPI(title="Hybrid Retriever Service")
 
-app = FastAPI()
+# ------------------------------------------------------------------
+# Database configuration
+# ------------------------------------------------------------------
 
-# Configuration
-DB_HOST = os.getenv("DB_HOST", "vector_db")
-DB_NAME = os.getenv("POSTGRES_DB", "ragdb")
-DB_USER = os.getenv("POSTGRES_USER", "postgres")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "postgres")
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "vector_db"),
+    "database": os.getenv("POSTGRES_DB", "ragdb"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", "postgres"),
+}
 
-# Load the baked model
-logger.info("Loading embedding model...")
-model = SentenceTransformer('./model_data', device='cpu')
-logger.info("Model loaded.")
+# ------------------------------------------------------------------
+# Component initialization
+# ------------------------------------------------------------------
+
+dense_ranker = DenseRanker(DB_CONFIG)
+sparse_ranker = SparseRanker(DB_CONFIG)
+merger = RRFMerger()
+
+# ------------------------------------------------------------------
+# Request models
+# ------------------------------------------------------------------
 
 class SearchRequest(BaseModel):
     query: str
-    k: int = 3
-    profile: Optional[str] = "P1"  # For future tenant isolation tests
+    k: int = 5
+    profile: Optional[str] = "P1"
 
-class SearchResult(BaseModel):
-    id: str
-    content: str
-    metadata: Dict[str, Any]
-    score: float
+# ------------------------------------------------------------------
+# Lifecycle events
+# ------------------------------------------------------------------
 
-class SearchResponse(BaseModel):
-    documents: List[SearchResult]
+@app.on_event("startup")
+async def startup_event():
+    # Start a non-blocking sparse index build on startup
+    asyncio.create_task(sparse_ranker.build_index_background())
 
-def get_db_connection():
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS
-    )
-    return conn
+# ------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------
 
-@app.post("/search", response_model=SearchResponse)
+@app.post("/refresh")
+async def refresh_index(background_tasks: BackgroundTasks):
+    """
+    Triggers a background rebuild of the sparse index.
+    Intended to be called after document ingestion.
+    """
+    logger.info("Received index refresh request.")
+    background_tasks.add_task(sparse_ranker.build_index_background)
+    return {"status": "refresh_scheduled"}
+
+@app.post("/search")
 async def search(request: SearchRequest):
-    logger.info(f"Searching for: {request.query}")
-    
-    conn = get_db_connection()
-    register_vector(conn)
-    cur = conn.cursor()
-    
-    try:
-        # 1. Vectorize the Query
-        query_vector = model.encode(request.query).tolist()
-        
-        # 2. Execute Semantic Search (Cosine Distance)
-        # The <=> operator in pgvector is Cosine Distance
-        cur.execute("""
-            SELECT id, content, metadata, 1 - (embedding <=> %s::vector) as similarity
-            FROM documents
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-        """, (query_vector, query_vector, request.k))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append(SearchResult(
-                id=row[0],
-                content=row[1],
-                metadata=row[2] if row[2] else {},
-                score=float(row[3])
-            ))
-            
-        logger.info(f"Found {len(results)} matches.")
-        return {"documents": results}
-        
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
+    logger.info(f"Hybrid search request received: '{request.query}'")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    try:
+        # Fetch more candidates than requested to improve fusion quality
+        candidate_k = request.k * 2
+
+        dense_hits = dense_ranker.search(request.query, k=candidate_k)
+        sparse_hits = sparse_ranker.search(request.query, k=candidate_k)
+
+        logger.info(
+            f"Retrieved candidates | Dense: {len(dense_hits)}, "
+            f"Sparse: {len(sparse_hits)}"
+        )
+
+        # Fuse dense and sparse results
+        merged_results = merger.merge(
+            dense_hits,
+            sparse_hits,
+            limit=request.k,
+        )
+
+        # Fetch full document content for the ranked results
+        final_docs = fetch_documents(merged_results)
+
+        return {"documents": final_docs}
+
+    except Exception as exc:
+        logger.error(f"Search failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def fetch_documents(ranked_results):
+    """
+    Fetches document content and metadata for ranked document IDs.
+    Preserves the ranking order.
+    """
+    if not ranked_results:
+        return []
+
+    doc_ids = [result["id"] for result in ranked_results]
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    query = "SELECT id, content, metadata FROM documents WHERE id = ANY(%s)"
+    cur.execute(query, (doc_ids,))
+    rows = cur.fetchall()
+
+    doc_map = {
+        row[0]: {
+            "content": row[1],
+            "metadata": row[2],
+        }
+        for row in rows
+    }
+
+    final_output = []
+    for result in ranked_results:
+        doc_data = doc_map.get(result["id"])
+        if doc_data:
+            final_output.append(
+                {
+                    "id": result["id"],
+                    "content": doc_data["content"],
+                    "metadata": doc_data["metadata"],
+                    "score": result["score"],
+                    "source_scores": result["source_scores"],
+                }
+            )
+
+    cur.close()
+    conn.close()
+    return final_output
