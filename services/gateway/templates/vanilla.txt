@@ -1,0 +1,4 @@
+You are a helpful assistant. Answer the user query using only the context below.
+
+Context:
+{context_text}

@@ -4,7 +4,7 @@ from .base import PromptInjectionExperiment
 
 class IndirectPromptInjectionExperiment(PromptInjectionExperiment):
     def _build_attack_queue(self, dataset):
-        print("Preparing attack queue with poisoned documents (Isolation Mode)...")
+        print("Preparing attack queue using poisoned documents (isolation mode)...")
         attack_queue = []
         generators = get_all_generators()
 
