@@ -1,12 +1,11 @@
 import os
 import logging
-import requests
 import time
+import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-import middleware
 from middleware import check_policy, log_telemetry
 
 # ------------------------------------------------------------------
@@ -15,11 +14,8 @@ from middleware import check_policy, log_telemetry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway")
-app = FastAPI(title="Secure RAG Gateway")
 
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
+app = FastAPI(title="Secure RAG Gateway")
 
 RETRIEVER_URL = os.getenv("RETRIEVER_URL", "http://retriever:8001")
 LLM_API_BASE = os.getenv("LLM_API_BASE", "http://host.docker.internal:11434/v1")
@@ -35,12 +31,10 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 
 def load_templates():
     """
-    Loads system prompt templates from disk.
-    Falls back to defaults if templates are missing.
+    Load system prompt templates from disk.
     """
     try:
-        if not os.path.exists(TEMPLATE_DIR):
-            os.makedirs(TEMPLATE_DIR)
+        os.makedirs(TEMPLATE_DIR, exist_ok=True)
 
         def read_template(name, default):
             path = os.path.join(TEMPLATE_DIR, f"{name}.txt")
@@ -50,15 +44,13 @@ def load_templates():
             return default
 
         TEMPLATES["vanilla"] = read_template(
-            "vanilla",
-            "Context:\n{context_text}",
+            "vanilla", "Context:\n{context_text}"
         )
         TEMPLATES["skeptical"] = read_template(
-            "skeptical",
-            "Context:\n{context_text}",
+            "skeptical", "Context:\n{context_text}"
         )
 
-        logger.info("System prompt templates loaded.")
+        logger.info("System prompt templates loaded")
 
     except Exception as exc:
         logger.error(f"Failed to load templates: {exc}")
@@ -79,6 +71,7 @@ class ChatRequest(BaseModel):
     topology: str = "sequential"
     profile: str = "P1"
     seed: int = 42
+    documents: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatResponse(BaseModel):
@@ -87,60 +80,109 @@ class ChatResponse(BaseModel):
     context: List[Dict[str, Any]] = []
 
 # ------------------------------------------------------------------
-# Endpoints
+# Helpers
 # ------------------------------------------------------------------
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "llm": LLM_MODEL_NAME}
+def fetch_documents(request: ChatRequest) -> List[Dict[str, Any]]:
+    """
+    Resolve documents based on topology.
+    """
+    if request.topology in {"pi", "direct_pi"}:
+        logger.info(
+            f"Retriever bypassed ({request.topology}). "
+            f"Using provided documents."
+        )
+        return request.documents or []
 
+    search_term = request.search_query or request.query
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_handler(request: ChatRequest, background_tasks: BackgroundTasks):
-    start_time = time.time()
-    logger.info(f"Received query: '{request.query}'")
-
-    actual_search_term = request.search_query or request.query
-
-    # Retrieval
     try:
-        retriever_response = requests.post(
+        response = requests.post(
             f"{RETRIEVER_URL}/search",
             json={
-                "query": actual_search_term,
+                "query": search_term,
                 "k": 1,
                 "profile": request.profile,
             },
             timeout=5,
         )
-        retriever_response.raise_for_status()
-        retrieved_docs = retriever_response.json().get("documents", [])
-        logger.info(f"Retrieved {len(retrieved_docs)} documents")
+        response.raise_for_status()
+        return response.json().get("documents", [])
 
     except Exception as exc:
         logger.error(f"Retriever request failed: {exc}")
-        raise HTTPException(status_code=503, detail="Retriever unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Retriever unavailable",
+        )
 
-    # Policy checks on query and retrieved context
-    check_policy(request.query, retrieved_docs)
 
-    # Context construction and templating
+def build_llm_messages(
+    request: ChatRequest,
+    retrieved_docs: List[Dict[str, Any]],
+):
+    """
+    Build system and user messages based on topology.
+    """
+    if request.topology in {"pi", "direct_pi"}:
+        system_content = TEMPLATES["vanilla"].format(
+            context_text="[Provided in user message]"
+        )
+
+        context_text = "\n\n".join(
+            doc.get("content", "") for doc in retrieved_docs
+        )
+
+        user_content = (
+            f"Context:\n{context_text}\n\n"
+            f"Task: {request.query}"
+        )
+
+        return system_content, user_content
+
     context_text = "\n\n".join(
-        f"[Document {doc['id']}]: {doc['content']}"
+        f"[Document {doc.get('id', 'unknown')}]: "
+        f"{doc.get('content', '')}"
         for doc in retrieved_docs
     )
 
     template_key = "skeptical" if request.profile == "P2" else "vanilla"
-    system_prompt = TEMPLATES.get(
-        template_key, TEMPLATES["vanilla"]
+
+    system_content = TEMPLATES.get(
+        template_key,
+        TEMPLATES["vanilla"],
     ).format(context_text=context_text)
 
-    # LLM generation
+    return system_content, request.query
+
+# ------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_handler(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+):
+    start_time = time.time()
+    logger.info(
+        f"Received query (topology={request.topology}): {request.query}"
+    )
+
+    retrieved_docs = fetch_documents(request)
+
+    # Policy enforcement
+    check_policy(request.query, retrieved_docs)
+
+    system_content, user_content = build_llm_messages(
+        request, retrieved_docs
+    )
+
     llm_payload = {
         "model": LLM_MODEL_NAME,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": request.query},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
         ],
         "stream": False,
         "temperature": 0.0,
@@ -154,13 +196,17 @@ async def chat_handler(request: ChatRequest, background_tasks: BackgroundTasks):
             timeout=90,
         )
         llm_response.raise_for_status()
-        generated_text = llm_response.json()["choices"][0]["message"]["content"]
+        generated_text = (
+            llm_response.json()["choices"][0]["message"]["content"]
+        )
 
     except Exception as exc:
         logger.error(f"LLM request failed: {exc}")
-        raise HTTPException(status_code=503, detail="LLM unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="LLM unavailable",
+        )
 
-    # Telemetry logging (async)
     latency = time.time() - start_time
     background_tasks.add_task(
         log_telemetry,
@@ -168,8 +214,8 @@ async def chat_handler(request: ChatRequest, background_tasks: BackgroundTasks):
             "timestamp": time.time(),
             "latency": latency,
             "profile": request.profile,
-            "docs_retrieved": len(retrieved_docs),
             "status": "success",
+            "topology": request.topology,
         },
     )
 
